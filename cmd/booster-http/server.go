@@ -13,8 +13,11 @@ import (
 
 	"github.com/NYTimes/gziphandler"
 	"github.com/fatih/color"
+	"github.com/filecoin-project/boost/extern/go-libipfs/gateway"
 	"github.com/filecoin-project/boost/metrics"
-	"github.com/filecoin-project/boostd-data/shared/tracing"
+	"github.com/ipfs/go-blockservice"
+	offline "github.com/ipfs/go-ipfs-exchange-offline"
+	//"github.com/filecoin-project/boostd-data/shared/tracing"
 	"github.com/filecoin-project/dagstore/mount"
 	"github.com/filecoin-project/go-fil-markets/piecestore"
 	"github.com/filecoin-project/go-fil-markets/retrievalmarket"
@@ -22,6 +25,7 @@ import (
 	"github.com/hashicorp/go-multierror"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
+	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"go.opencensus.io/stats"
 )
 
@@ -43,6 +47,7 @@ type HttpServer struct {
 	port          int
 	allowIndexing bool
 	api           HttpServerApi
+	bstore        blockstore.Blockstore
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -51,24 +56,44 @@ type HttpServer struct {
 
 type HttpServerApi interface {
 	GetPieceInfo(pieceCID cid.Cid) (*piecestore.PieceInfo, error)
+	GetPiecesContainingPayload(ctx context.Context, payloadCID cid.Cid) ([]cid.Cid, error)
 	IsUnsealed(ctx context.Context, sectorID abi.SectorNumber, offset abi.UnpaddedPieceSize, length abi.UnpaddedPieceSize) (bool, error)
 	UnsealSectorAt(ctx context.Context, sectorID abi.SectorNumber, pieceOffset abi.UnpaddedPieceSize, length abi.UnpaddedPieceSize) (mount.Reader, error)
 }
 
-func NewHttpServer(path string, port int, allowIndexing bool, api HttpServerApi) *HttpServer {
-	return &HttpServer{path: path, port: port, allowIndexing: allowIndexing, api: api}
+func NewHttpServer(path string, port int, allowIndexing bool, api HttpServerApi, bstore blockstore.Blockstore) *HttpServer {
+	return &HttpServer{path: path, port: port, allowIndexing: allowIndexing, api: api, bstore: bstore}
 }
 
 func (s *HttpServer) pieceBasePath() string {
 	return s.path + "/piece/"
 }
 
-func (s *HttpServer) Start(ctx context.Context) {
+//func (s *HttpServer) ipfsBasePath() string {
+//	return s.path + "/ipfs/"
+//}
+
+func (s *HttpServer) blockstore() blockstore.Blockstore {
+	return nil
+}
+
+func (s *HttpServer) Start(ctx context.Context) error {
 	s.ctx, s.cancel = context.WithCancel(ctx)
+
+	blockService := blockservice.New(s.bstore, offline.Exchange(s.bstore))
+	gw, err := NewBlocksGateway(blockService, nil)
+	if err != nil {
+		return fmt.Errorf("creating blocks gateway: %w", err)
+	}
+	headers := map[string][]string{}
+	gateway.AddAccessControlHeaders(headers)
+	gwHandler := gateway.NewHandler(gateway.Config{Headers: headers}, gw)
 
 	listenAddr := fmt.Sprintf(":%d", s.port)
 	handler := http.NewServeMux()
 	handler.HandleFunc(s.pieceBasePath(), s.handleByPieceCid)
+	//handler.HandleFunc(s.ipfsBasePath(), s.handleByPayloadCid)
+	handler.Handle("/ipfs/", gwHandler)
 	handler.HandleFunc("/", s.handleIndex)
 	handler.HandleFunc("/index.html", s.handleIndex)
 	handler.HandleFunc("/info", s.handleInfo)
@@ -88,6 +113,8 @@ func (s *HttpServer) Start(ctx context.Context) {
 			log.Fatalf("http.ListenAndServe(): %w", err)
 		}
 	}()
+
+	return nil
 }
 
 func (s *HttpServer) Stop() error {
@@ -131,8 +158,9 @@ func (s *HttpServer) handleInfo(w http.ResponseWriter, r *http.Request) {
 
 func (s *HttpServer) handleByPieceCid(w http.ResponseWriter, r *http.Request) {
 	startTime := time.Now()
-	ctx, span := tracing.Tracer.Start(r.Context(), "http.piece_cid")
-	defer span.End()
+	ctx := r.Context()
+	//ctx, span := tracing.Tracer.Start(r.Context(), "http.piece_cid")
+	//defer span.End()
 	stats.Record(ctx, metrics.HttpPieceByCidRequestCount.M(1))
 
 	// Remove the path up to the piece cid
@@ -169,14 +197,64 @@ func (s *HttpServer) handleByPieceCid(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Set an Etag based on the piece cid
-	etag := pieceCid.String()
-	w.Header().Set("Etag", etag)
+	setEtag(w, pieceCid.String())
 
 	serveContent(w, r, content)
 
 	stats.Record(ctx, metrics.HttpPieceByCid200ResponseCount.M(1))
 	stats.Record(ctx, metrics.HttpPieceByCidRequestDuration.M(float64(time.Since(startTime).Milliseconds())))
 }
+
+//func (s *HttpServer) handleByPayloadCid(w http.ResponseWriter, r *http.Request) {
+//	startTime := time.Now()
+//	ctx, span := tracing.Tracer.Start(r.Context(), "http.payload_cid")
+//	defer span.End()
+//	stats.Record(ctx, metrics.HttpPayloadByCidRequestCount.M(1))
+//
+//	// Remove the path up to the payload cid
+//	prefixLen := len(s.ipfsBasePath())
+//	if len(r.URL.Path) <= prefixLen {
+//		msg := fmt.Sprintf("path '%s' is missing payload CID", r.URL.Path)
+//		writeError(w, r, http.StatusBadRequest, msg)
+//		stats.Record(ctx, metrics.HttpPayloadByCid400ResponseCount.M(1))
+//		return
+//	}
+//
+//	pieceCidStr := r.URL.Path[prefixLen:]
+//	payloadCid, err := cid.Parse(pieceCidStr)
+//	if err != nil {
+//		msg := fmt.Sprintf("parsing payload CID '%s': %s", pieceCidStr, err.Error())
+//		writeError(w, r, http.StatusBadRequest, msg)
+//		stats.Record(ctx, metrics.HttpPayloadByCid400ResponseCount.M(1))
+//		return
+//	}
+//
+//	// TODO: parse format based on query params and headers
+//	format := ""
+//
+//	// Get a reader over the piece
+//	content, err := s.getPayloadContent(ctx, payloadCid)
+//	if err != nil {
+//		if isNotFoundError(err) {
+//			writeError(w, r, http.StatusNotFound, err.Error())
+//			stats.Record(ctx, metrics.HttpPayloadByCid404ResponseCount.M(1))
+//			return
+//		}
+//		log.Errorf("getting content for CID %s: %s", payloadCid, err)
+//		msg := fmt.Sprintf("server error getting content for CID %s", payloadCid)
+//		writeError(w, r, http.StatusInternalServerError, msg)
+//		stats.Record(ctx, metrics.HttpPayloadByCid500ResponseCount.M(1))
+//		return
+//	}
+//
+//	// Set an Etag based on the payload cid and format
+//	setEtag(w, payloadCid.String()+"/"+format)
+//
+//	serveContent(w, r, content)
+//
+//	stats.Record(ctx, metrics.HttpPayloadByCid200ResponseCount.M(1))
+//	stats.Record(ctx, metrics.HttpPayloadByCidRequestDuration.M(float64(time.Since(startTime).Milliseconds())))
+//}
 
 func serveContent(w http.ResponseWriter, r *http.Request, content io.ReadSeeker) {
 	// Set the Content-Type header explicitly so that http.ServeContent doesn't
@@ -235,6 +313,11 @@ func serveContent(w http.ResponseWriter, r *http.Request, content io.ReadSeeker)
 	}
 }
 
+func setEtag(w http.ResponseWriter, etag string) {
+	// Note: the etag must be surrounded by "quotes"
+	w.Header().Set("Etag", `"`+etag+`"`)
+}
+
 // isNotFoundError falls back to checking the error string for "not found".
 // Unfortunately we can't always use errors.Is() because the error might
 // have crossed an RPC boundary.
@@ -281,7 +364,7 @@ func (s *HttpServer) getPieceContent(ctx context.Context, pieceCid cid.Cid) (io.
 }
 
 func (s *HttpServer) unsealedDeal(ctx context.Context, pieceInfo piecestore.PieceInfo) (*piecestore.DealInfo, error) {
-	// There should always been deals in the PieceInfo, but check just in case
+	// There should always be deals in the PieceInfo, but check just in case
 	if len(pieceInfo.Deals) == 0 {
 		return nil, fmt.Errorf("there are no deals containing piece %s: %w", pieceInfo.PieceCID, ErrNotFound)
 	}
@@ -327,6 +410,50 @@ func (s *HttpServer) unsealedDeal(ctx context.Context, pieceInfo piecestore.Piec
 
 	return nil, fmt.Errorf("checking unsealed status of %d deals containing piece %s - %d are sealed, %d had errors: %s: %w",
 		len(pieceInfo.Deals), pieceInfo.PieceCID, sealedCount, len(pieceInfo.Deals)-sealedCount, dealSectors, allErr)
+}
+
+func (s *HttpServer) getPayloadContent(ctx context.Context, payloadCid cid.Cid) (io.ReadSeeker, error) {
+	// Get the pieces containing the payload
+	pieceCids, err := s.api.GetPiecesContainingPayload(ctx, payloadCid)
+	if err != nil {
+		return nil, fmt.Errorf("getting pieces containing payload cid %s: %w", payloadCid, err)
+	}
+
+	// Loop over each piece containing the payload, and attempt to find an
+	// unsealed sector containing the piece
+	dealInfo, err := func() (*piecestore.DealInfo, error) {
+		var allErr error
+		for _, pieceCid := range pieceCids {
+			// Get the deals for the piece
+			pieceInfo, err := s.api.GetPieceInfo(pieceCid)
+			if err != nil {
+				return nil, fmt.Errorf("getting sector info for piece %s: %w", payloadCid, err)
+			}
+
+			// Get the first unsealed deal
+			di, err := s.unsealedDeal(ctx, *pieceInfo)
+			if err == nil {
+				// Found an unsealed deal, return it
+				return di, nil
+			}
+
+			// No unsealed deal found, save the error and continue looping
+			// over the remaining piece cids
+			allErr = multierror.Append(allErr, err)
+		}
+		return nil, allErr
+	}()
+	if err != nil {
+		return nil, fmt.Errorf("getting unsealed CAR file: %w", err, err)
+	}
+
+	// Get the raw piece data from the sector
+	pieceReader, err := s.api.UnsealSectorAt(ctx, dealInfo.SectorID, dealInfo.Offset.Unpadded(), dealInfo.Length.Unpadded())
+	if err != nil {
+		return nil, fmt.Errorf("getting raw data from sector %d: %w", dealInfo.SectorID, err)
+	}
+
+	return pieceReader, nil
 }
 
 // writeErrorWatcher calls onError if there is an error writing to the writer

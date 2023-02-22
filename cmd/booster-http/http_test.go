@@ -22,7 +22,7 @@ func TestNewHttpServer(t *testing.T) {
 
 	// Create a new mock Http server
 	ctrl := gomock.NewController(t)
-	httpServer := NewHttpServer("", 7777, false, mocks_booster_http.NewMockHttpServerApi(ctrl))
+	httpServer := NewHttpServer("", 7777, false, mocks_booster_http.NewMockHttpServerApi(ctrl), nil)
 	httpServer.Start(context.Background())
 
 	// Check that server is up
@@ -40,7 +40,7 @@ func TestHttpGzipResponse(t *testing.T) {
 	// Create a new mock Http server with custom functions
 	ctrl := gomock.NewController(t)
 	mockHttpServer := mocks_booster_http.NewMockHttpServerApi(ctrl)
-	httpServer := NewHttpServer("", 7777, false, mockHttpServer)
+	httpServer := NewHttpServer("", 7777, false, mockHttpServer, nil)
 	httpServer.Start(context.Background())
 
 	// Create mock unsealed file for piece/car
@@ -105,7 +105,7 @@ func TestHttpInfo(t *testing.T) {
 
 	// Create a new mock Http server
 	ctrl := gomock.NewController(t)
-	httpServer := NewHttpServer("", 7777, false, mocks_booster_http.NewMockHttpServerApi(ctrl))
+	httpServer := NewHttpServer("", 7777, false, mocks_booster_http.NewMockHttpServerApi(ctrl), nil)
 	httpServer.Start(context.Background())
 
 	response, err := http.Get("http://localhost:7777/info")

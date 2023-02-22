@@ -10,8 +10,9 @@ import (
 	"github.com/filecoin-project/boost/api"
 	bclient "github.com/filecoin-project/boost/api/client"
 	cliutil "github.com/filecoin-project/boost/cli/util"
+	"github.com/filecoin-project/boost/cmd/booster-bitswap/remoteblockstore"
 	"github.com/filecoin-project/boost/cmd/lib"
-	"github.com/filecoin-project/boostd-data/shared/tracing"
+	//"github.com/filecoin-project/boostd-data/shared/tracing"
 	"github.com/filecoin-project/dagstore/mount"
 	"github.com/filecoin-project/go-fil-markets/piecestore"
 	"github.com/filecoin-project/go-jsonrpc"
@@ -109,11 +110,11 @@ var runCmd = &cli.Command{
 		enableTracing := cctx.Bool("tracing")
 		var tracingStopper func(context.Context) error
 		if enableTracing {
-			tracingStopper, err = tracing.New("booster-http", cctx.String("tracing-endpoint"))
-			if err != nil {
-				return fmt.Errorf("failed to instantiate tracer: %w", err)
-			}
-			log.Info("Tracing exporter enabled")
+			//tracingStopper, err = tracing.New("booster-http", cctx.String("tracing-endpoint"))
+			//if err != nil {
+			//	return fmt.Errorf("failed to instantiate tracer: %w", err)
+			//}
+			//log.Info("Tracing exporter enabled")
 		}
 
 		// Create the sector accessor
@@ -124,6 +125,7 @@ var runCmd = &cli.Command{
 		defer storageCloser()
 
 		allowIndexing := cctx.Bool("allow-indexing")
+
 		// Create the server API
 		sapi := serverApi{ctx: ctx, bapi: bapi, sa: sa}
 		server := NewHttpServer(
@@ -131,6 +133,7 @@ var runCmd = &cli.Command{
 			cctx.Int("port"),
 			allowIndexing,
 			sapi,
+			remoteblockstore.NewRemoteBlockstore(bapi),
 		)
 
 		// Start the server
@@ -143,7 +146,10 @@ var runCmd = &cli.Command{
 			indexingStr = "Disabled"
 		}
 		log.Info("On-the-fly indexing of CAR files is " + indexingStr)
-		server.Start(ctx)
+		err = server.Start(ctx)
+		if err != nil {
+			return fmt.Errorf("starting http server: %w", err)
+		}
 
 		// Monitor for shutdown.
 		<-ctx.Done()
@@ -180,6 +186,10 @@ var _ HttpServerApi = (*serverApi)(nil)
 
 func (s serverApi) GetPieceInfo(pieceCID cid.Cid) (*piecestore.PieceInfo, error) {
 	return s.bapi.PiecesGetPieceInfo(s.ctx, pieceCID)
+}
+
+func (s serverApi) GetPiecesContainingPayload(ctx context.Context, payloadCID cid.Cid) ([]cid.Cid, error) {
+	return s.bapi.BoostDagstorePiecesContainingMultihash(ctx, payloadCID.Hash())
 }
 
 func (s serverApi) IsUnsealed(ctx context.Context, sectorID abi.SectorNumber, offset abi.UnpaddedPieceSize, length abi.UnpaddedPieceSize) (bool, error) {
